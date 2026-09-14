@@ -42,7 +42,23 @@ rootCommand.Subcommands.Add(getCommand);
 rootCommand.Subcommands.Add(setCommand);
 rootCommand.Subcommands.Add(saveCommand);
 
-NVIDIA.Initialize();
+// nvapi64.dll is placed on disk only by an actual NVIDIA display driver
+// install. A DllNotFoundException here means there's no NVIDIA hardware/
+// driver on this machine at all (e.g. a software-rendered preview engine) --
+// a real, expected outcome for some hosts in this fleet, not a bug. Exit
+// code 2 lets a wrapper script tell "no NVIDIA here, skip it" apart from
+// exit code 1 (a genuine usage/validation error) without parsing text.
+try
+{
+    NVIDIA.Initialize();
+}
+catch (DllNotFoundException)
+{
+    Console.Error.WriteLine("No NVIDIA driver detected on this machine (nvapi64.dll not found). " +
+                             "This host likely has no NVIDIA GPU/driver installed.");
+    return 2;
+}
+
 DRSSessionHandle session = DRSApi.CreateSession();
 DRSApi.LoadSettings(session);
 
@@ -120,7 +136,22 @@ int Get(string? profileName, string? appName)
             if (onProfile.HasValue)
             {
                 value = onProfile.Value.CurrentValue;
-                source = "explicit";
+                // This is the driver's own authoritative answer (NVDRS_SETTING's
+                // settingLocation field, documented as describing "where the
+                // value in CurrentValue comes from"), not our guess.
+                // GetSetting against a specific profile can still resolve to a
+                // value actually backed by the global/base profile or the
+                // driver default -- exactly what NVIDIA Control Panel's
+                // "Use the global setting" reflects. Trusting HasValue alone
+                // (the old logic) mislabeled these as "explicit".
+                source = onProfile.Value.SettingLocation switch
+                {
+                    DRSSettingLocation.CurrentProfile => "explicit",
+                    DRSSettingLocation.GlobalProfile => "global profile",
+                    DRSSettingLocation.BaseProfile => "base profile",
+                    DRSSettingLocation.DefaultProfile => "driver default",
+                    _ => $"unknown location ({onProfile.Value.SettingLocation})"
+                };
             }
             else
             {
@@ -252,7 +283,16 @@ int Set(FileInfo file, bool andSave)
         var currentText = current.HasValue ? current.Value.CurrentValue?.ToString() ?? "" : "(not set on this profile)";
         var label = string.IsNullOrEmpty(keyLabel) ? $"0x{id:X8}" : keyLabel;
 
-        if (current.HasValue && currentText == newValue.ToString())
+        // A match is only truly a no-op if it's already explicit on THIS
+        // profile (SettingLocation == CurrentProfile). GetSetting can return
+        // a value that happens to equal newValue while actually resolving
+        // from GlobalProfile/BaseProfile/DefaultProfile -- HasValue alone
+        // doesn't distinguish that. Skipping on HasValue alone (the old
+        // logic) would silently leave such a setting un-pinned forever,
+        // exactly the "looks the same, isn't actually local" risk this tool
+        // exists to close.
+        bool alreadyExplicit = current.HasValue && current.Value.SettingLocation == DRSSettingLocation.CurrentProfile;
+        if (alreadyExplicit && currentText == newValue.ToString())
         {
             Console.WriteLine($"  {label} = {newValue}  (unchanged)");
             continue;

@@ -11,9 +11,14 @@ HOSTS := $(shell grep -v '^\s*\#' hosts.txt 2>/dev/null | grep -v '^\s*$$')
 
 publish: $(STAMP_DIR)/publish
 
-# Rebuild only when project sources actually change.
+# Self-contained + single-file: the fleet's system-wide .NET install can't
+# be trusted to be consistent (seen versions from 6.0 through 8.0 across
+# otherwise-identical hosts), and fixing that means touching shared system
+# state on every machine for this tool's sake. Bundling the runtime instead
+# means every host runs the exact same bits regardless of what else is
+# installed there.
 $(STAMP_DIR)/publish: $(shell find $(PROJECT_DIR) -name '*.cs' -o -name '*.csproj') | $(STAMP_DIR)
-	dotnet publish $(PROJECT_DIR) -r win-x64 --self-contained false
+	dotnet publish $(PROJECT_DIR) -r win-x64
 	touch $@
 
 $(ZIP): $(STAMP_DIR)/publish
