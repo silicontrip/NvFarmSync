@@ -1,0 +1,13 @@
+{
+  "Topology": "Basic_1X2",
+  "IsEnable": true,
+  "IsPossible": true,
+  "DisplaySettings": {
+    "Width": 3840,
+    "Height": 2160,
+    "BitsPerPixel": 32,
+    "Frequency": 50
+  },
+  "OverlapX": 0,
+  "OverlapY": 0
+}
