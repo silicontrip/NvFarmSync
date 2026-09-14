@@ -3,6 +3,7 @@ using System.Text.Json;
 using NvAPIWrapper;
 using NvAPIWrapper.Native;
 using NvAPIWrapper.Native.Display;
+using NvAPIWrapper.Native.Exceptions;
 using NvAPIWrapper.Native.Interfaces.Mosaic;
 using NvAPIWrapper.Native.Mosaic;
 using NvAPIWrapper.Native.Mosaic.Structures;
@@ -53,14 +54,42 @@ catch (DllNotFoundException)
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
-listCommand.SetAction(_ => List());
-getCommand.SetAction(_ => Get());
+listCommand.SetAction(_ => RunSafely(List));
+getCommand.SetAction(_ => RunSafely(Get));
 setCommand.SetAction(parseResult =>
-    SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true));
+    RunSafely(() => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true)));
 validateCommand.SetAction(parseResult =>
-    SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: false));
+    RunSafely(() => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: false)));
 
 return rootCommand.Parse(args).Invoke();
+
+// System.CommandLine 2.0.12 doesn't catch action exceptions itself (confirmed:
+// an uncaught one reaches the process as a raw .NET stack trace). NVAPI calls
+// fail with only a status code and, often, no further message text (the
+// driver's own error-message lookup can return nothing beyond the status
+// name itself) -- so there's nothing to gain from a full stack trace here,
+// only noise. Exit code 3 distinguishes "a real NVAPI call failed" from
+// exit code 2 (no driver present) and exit code 1 (usage/validation error).
+int RunSafely(Func<int> action)
+{
+    try
+    {
+        return action();
+    }
+    catch (NVIDIAApiException ex)
+    {
+        // Mosaic operations can be session-sensitive: enumerating the actual
+        // active grid/display topology is tied to the session that owns the
+        // physical console (Session 1+), while a service-spawned process
+        // (e.g. anything launched via sshd, which runs in Session 0 by
+        // default) may not have that access even with full privileges.
+        // Printing this makes that theory directly checkable by comparing
+        // against `query session` at the console, instead of guessing.
+        var sessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
+        Console.Error.WriteLine($"NVAPI call failed: {ex.Status} -- {ex.Message} (PID {Environment.ProcessId}, Session {sessionId})");
+        return 3;
+    }
+}
 
 int List()
 {
