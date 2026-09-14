@@ -1,0 +1,8 @@
+.stamp/
+bin/
+nvidiaProfileInspector/
+obj/
+third_party/
+*.sh
+*.txt
+*.user
