@@ -30,7 +30,7 @@ Options:
   --version       Show version information
 
 Commands:
-  list             NvAPI_Mosaic_EnumDisplayGrids -- list the current display grid topology (JSON, stdout)
+  list             NvAPI_Mosaic_EnumDisplayGrids -- list the current display grid topology (JSON, stdout) requires active session not session 0
   get              NvAPI_Mosaic_GetCurrentTopology -- get the current topology brief and overlap (JSON, stdout)
   set <file>       NvAPI_Mosaic_SetDisplayGrids -- apply a grid topology from a JSON file
   validate <file>  NvAPI_Mosaic_ValidateDisplayGrids -- validate a grid topology from a JSON file without applying it
