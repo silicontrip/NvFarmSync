@@ -18,6 +18,12 @@ var fileArgument = new Argument<FileInfo>("file")
 {
     Description = "JSON file produced by 'list'"
 };
+var outOption = new Option<FileInfo?>("--out")
+{
+    Description = "Write output to this file instead of stdout. Needed when running via a cross-session " +
+                  "launcher (e.g. CreateProcessAsUser-based tools) whose stdout doesn't reach the caller.",
+    Recursive = true
+};
 
 var listCommand = new Command("list", "NvAPI_Mosaic_EnumDisplayGrids -- list the current display grid topology (JSON, stdout)");
 var getCommand = new Command("get", "NvAPI_Mosaic_GetCurrentTopology -- get the current topology brief and overlap (JSON, stdout)");
@@ -33,6 +39,7 @@ var validateCommand = new Command("validate", "NvAPI_Mosaic_ValidateDisplayGrids
 };
 
 var rootCommand = new RootCommand("NvMosaic -- NVIDIA Mosaic display topology fleet management");
+rootCommand.Options.Add(outOption);
 rootCommand.Subcommands.Add(listCommand);
 rootCommand.Subcommands.Add(getCommand);
 rootCommand.Subcommands.Add(setCommand);
@@ -54,12 +61,12 @@ catch (DllNotFoundException)
 
 var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 
-listCommand.SetAction(_ => RunSafely(List));
-getCommand.SetAction(_ => RunSafely(Get));
+listCommand.SetAction(parseResult => RunSafely(parseResult, List));
+getCommand.SetAction(parseResult => RunSafely(parseResult, Get));
 setCommand.SetAction(parseResult =>
-    RunSafely(() => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true)));
+    RunSafely(parseResult, () => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true)));
 validateCommand.SetAction(parseResult =>
-    RunSafely(() => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: false)));
+    RunSafely(parseResult, () => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: false)));
 
 return rootCommand.Parse(args).Invoke();
 
@@ -70,8 +77,22 @@ return rootCommand.Parse(args).Invoke();
 // name itself) -- so there's nothing to gain from a full stack trace here,
 // only noise. Exit code 3 distinguishes "a real NVAPI call failed" from
 // exit code 2 (no driver present) and exit code 1 (usage/validation error).
-int RunSafely(Func<int> action)
+int RunSafely(ParseResult parseResult, Func<int> action)
 {
+    // --out redirects Console.Out only (not Console.Error) so a wrapper
+    // watching stderr, or a human running this directly, still sees errors
+    // immediately even when the actual payload is going to a file -- the
+    // same split a --logfile convention would give you, without needing
+    // every call site to pick a writer explicitly.
+    var outFile = parseResult.GetValue(outOption);
+    StreamWriter? fileWriter = null;
+    var originalOut = Console.Out;
+    if (outFile != null)
+    {
+        fileWriter = new StreamWriter(outFile.FullName, append: false) { AutoFlush = true };
+        Console.SetOut(fileWriter);
+    }
+
     try
     {
         return action();
@@ -88,6 +109,14 @@ int RunSafely(Func<int> action)
         var sessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
         Console.Error.WriteLine($"NVAPI call failed: {ex.Status} -- {ex.Message} (PID {Environment.ProcessId}, Session {sessionId})");
         return 3;
+    }
+    finally
+    {
+        if (fileWriter != null)
+        {
+            Console.SetOut(originalOut);
+            fileWriter.Dispose();
+        }
     }
 }
 
