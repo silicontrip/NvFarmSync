@@ -1,7 +1,7 @@
 SSH_USER    ?= S_MHeath
 REMOTE_DIR  ?= C:\Users\$(SSH_USER)\bin
 STAMP_DIR   := .stamp
-TOOLS       := NvFarmSync NvMosaic
+TOOLS       := NvFarmSync NvMosaic NvGSync
 
 HOSTS := $(shell grep -v '^\s*\#' hosts.txt 2>/dev/null | grep -v '^\s*$$')
 
@@ -25,7 +25,7 @@ deploy: $(addprefix deploy-,$(TOOLS))
 define TOOL_RULES
 publish-$(1): $(STAMP_DIR)/publish-$(1)
 
-$(STAMP_DIR)/publish-$(1): src/$(1)/Program.cs src/$(1)/$(1).csproj | $(STAMP_DIR)
+$(STAMP_DIR)/publish-$(1): $(wildcard src/$(1)/*.cs) src/$(1)/$(1).csproj | $(STAMP_DIR)
 	dotnet publish src/$(1) -r win-x64
 	touch $$@
 
@@ -42,6 +42,7 @@ endef
 
 $(eval $(call TOOL_RULES,NvFarmSync))
 $(eval $(call TOOL_RULES,NvMosaic))
+$(eval $(call TOOL_RULES,NvGSync))
 
 $(STAMP_DIR):
 	mkdir -p $(STAMP_DIR)
