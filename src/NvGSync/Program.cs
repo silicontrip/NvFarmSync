@@ -75,6 +75,9 @@ var statusParamsCommand = new Command("get-status-parameters", "NvAPI_GSync_GetS
 {
     deviceOption
 };
+var debugSizesCommand = new Command("debug-sizes",
+    "Print Marshal.SizeOf for every GSync struct -- no NVAPI calls, safe to run anywhere. " +
+    "Use when a call fails with IncompatibleStructureVersion to check the computed size against hand-calculated expectations.");
 
 var rootCommand = new RootCommand("NvGSync -- NVIDIA Quadro Sync (GSync) fleet management");
 rootCommand.Options.Add(outOption);
@@ -87,6 +90,7 @@ rootCommand.Subcommands.Add(setControlCommand);
 rootCommand.Subcommands.Add(adjustDelayCommand);
 rootCommand.Subcommands.Add(syncStatusCommand);
 rootCommand.Subcommands.Add(statusParamsCommand);
+rootCommand.Subcommands.Add(debugSizesCommand);
 
 // See NvFarmSync/NvMosaic for why this is caught explicitly rather than
 // left as an unhandled crash: no NVIDIA driver present is an expected
@@ -118,6 +122,7 @@ adjustDelayCommand.SetAction(parseResult => RunSafely(parseResult, () => AdjustS
 syncStatusCommand.SetAction(parseResult =>
     RunSafely(parseResult, () => GetSyncStatus(parseResult.GetValue(deviceOption), parseResult.GetValue(gpuOption))));
 statusParamsCommand.SetAction(parseResult => RunSafely(parseResult, () => GetStatusParameters(parseResult.GetValue(deviceOption))));
+debugSizesCommand.SetAction(parseResult => RunSafely(parseResult, DebugSizes));
 
 return rootCommand.Parse(args).Invoke();
 
@@ -319,6 +324,33 @@ int GetStatusParameters(int deviceIndex)
         p.InternalSlave
     };
     Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    return 0;
+}
+
+// Pure diagnostic: no NVAPI calls, nothing touches the driver. "Expected"
+// is hand-calculated from nvapi.h's field layout (x64 natural alignment,
+// bitfields packed into one 4-byte slot each) -- a mismatch here means a
+// struct's C# layout doesn't match the native one, which is exactly what
+// IncompatibleStructureVersion from the driver would indicate.
+int DebugSizes()
+{
+    void Row(string name, int actual, int expected)
+    {
+        var flag = actual == expected ? "OK" : "MISMATCH";
+        Console.WriteLine($"{name,-24} actual={actual,-4} expected={expected,-4} {flag}");
+    }
+
+    Row(nameof(NV_GSYNC_CAPABILITIES), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_CAPABILITIES>(), 28);
+    Row(nameof(NV_GSYNC_CAPABILITIES_V2), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_CAPABILITIES_V2>(), 20);
+    Row(nameof(NV_GSYNC_CAPABILITIES_V1), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_CAPABILITIES_V1>(), 16);
+    Row(nameof(NV_GSYNC_GPU), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_GPU>(), 40);
+    Row(nameof(NV_GSYNC_DISPLAY), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_DISPLAY>(), 96);
+    Row(nameof(NV_GSYNC_DISPLAY_V1), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_DISPLAY_V1>(), 16);
+    Row(nameof(NV_GSYNC_DELAY), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_DELAY>(), 20);
+    Row(nameof(NV_GSYNC_CONTROL_PARAMS), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_CONTROL_PARAMS>(), 72);
+    Row(nameof(NV_GSYNC_CONTROL_PARAMS_V1), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_CONTROL_PARAMS_V1>(), 64);
+    Row(nameof(NV_GSYNC_STATUS), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_STATUS>(), 16);
+    Row(nameof(NV_GSYNC_STATUS_PARAMS), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_STATUS_PARAMS>(), 36);
     return 0;
 }
 
