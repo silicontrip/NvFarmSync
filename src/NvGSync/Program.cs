@@ -92,6 +92,15 @@ var getAllCommand = new Command("get-all",
     deviceOption,
     gpuOption
 };
+var setAllCommand = new Command("set-all",
+    "Composite: applies SyncState (if present) via NvAPI_GSync_SetSyncStateSettings, then ControlParameters " +
+    "(if present) via NvAPI_GSync_SetControlParameters, from one file -- a full restore in one command instead " +
+    "of two. Accepts a 'get-all' dump directly (its other fields are ignored) or a minimal file with just the " +
+    "SyncState and/or ControlParameters keys.")
+{
+    deviceOption,
+    fileArgument
+};
 var debugSizesCommand = new Command("debug-sizes",
     "Print Marshal.SizeOf for every GSync struct -- no NVAPI calls, safe to run anywhere. " +
     "Use when a call fails with IncompatibleStructureVersion to check the computed size against hand-calculated expectations.");
@@ -109,6 +118,7 @@ rootCommand.Subcommands.Add(syncStatusCommand);
 rootCommand.Subcommands.Add(statusParamsCommand);
 rootCommand.Subcommands.Add(getSyncStateCommand);
 rootCommand.Subcommands.Add(getAllCommand);
+rootCommand.Subcommands.Add(setAllCommand);
 rootCommand.Subcommands.Add(debugSizesCommand);
 
 // See NvFarmSync/NvMosaic for why this is caught explicitly rather than
@@ -144,6 +154,8 @@ statusParamsCommand.SetAction(parseResult => RunSafely(parseResult, () => GetSta
 getSyncStateCommand.SetAction(parseResult => RunSafely(parseResult, () => GetSyncState(parseResult.GetValue(deviceOption))));
 getAllCommand.SetAction(parseResult =>
     RunSafely(parseResult, () => GetAll(parseResult.GetValue(deviceOption), parseResult.GetValue(gpuOption))));
+setAllCommand.SetAction(parseResult =>
+    RunSafely(parseResult, () => SetAll(parseResult.GetValue(deviceOption), parseResult.GetValue(fileArgument)!)));
 debugSizesCommand.SetAction(parseResult => RunSafely(parseResult, DebugSizes));
 
 return rootCommand.Parse(args).Invoke();
@@ -194,25 +206,55 @@ NvGSyncDeviceHandle ResolveDevice(int index)
     return devices[index];
 }
 
+// enum-sync-devices, query-capabilities, get-topology, adjust-sync-delay,
+// get-sync-status, and get-status-parameters have no 'set-*' counterpart --
+// nothing ever needs to deserialize their output, so there's no reason to
+// pay JSON's structure for them. A flat "Key: Value" line per field is
+// plainer and diffs cleanly line-by-line, unlike JSON's indentation moving
+// around between runs for no real reason. get-control-parameters,
+// get-sync-state, and get-all stay JSON because they ARE the save/restore
+// format for a corresponding set-* command.
 int EnumSyncDevices()
 {
     var devices = GSyncApi.EnumSyncDevices();
-    var dto = devices.Select((d, i) => new { Index = i, Handle = d.ToString() }).ToArray();
-    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    for (var i = 0; i < devices.Length; i++)
+    {
+        Console.WriteLine($"{i}: {devices[i]}");
+    }
     return 0;
 }
 
 int QueryCapabilities(int deviceIndex)
 {
     var caps = GSyncApi.QueryCapabilities(ResolveDevice(deviceIndex));
-    Console.WriteLine(JsonSerializer.Serialize(ToCapabilitiesDto(caps), jsonOptions));
+    Console.WriteLine($"BoardId: {caps.BoardId}");
+    Console.WriteLine($"Revision: {caps.Revision}");
+    Console.WriteLine($"ExtendedRevision: {caps.ExtendedRevision}");
+    Console.WriteLine($"CapFlags: {caps.CapFlags}");
+    Console.WriteLine($"IsMulDivSupported: {caps.IsMulDivSupported}");
+    Console.WriteLine($"MaxMulDivValue: {caps.MaxMulDivValue}");
     return 0;
 }
 
 int GetTopology(int deviceIndex)
 {
     var (gpus, displays) = GSyncApi.GetTopology(ResolveDevice(deviceIndex));
-    Console.WriteLine(JsonSerializer.Serialize(ToTopologyDto(gpus, displays), jsonOptions));
+    for (var i = 0; i < gpus.Length; i++)
+    {
+        var g = gpus[i];
+        Console.WriteLine($"Gpu[{i}].PhysicalGpu: 0x{g.PhysicalGpu.ToInt64():X}");
+        Console.WriteLine($"Gpu[{i}].Connector: {g.Connector}");
+        Console.WriteLine($"Gpu[{i}].ProxyPhysicalGpu: {(g.ProxyPhysicalGpu == IntPtr.Zero ? "" : $"0x{g.ProxyPhysicalGpu.ToInt64():X}")}");
+        Console.WriteLine($"Gpu[{i}].IsSynced: {g.IsSynced}");
+    }
+    for (var i = 0; i < displays.Length; i++)
+    {
+        var d = displays[i];
+        Console.WriteLine($"Display[{i}].DisplayId: {d.DisplayId}");
+        Console.WriteLine($"Display[{i}].IsMasterable: {d.IsMasterable}");
+        Console.WriteLine($"Display[{i}].UseExactTiming: {d.UseExactTiming}");
+        Console.WriteLine($"Display[{i}].SyncState: {d.SyncState}");
+    }
     return 0;
 }
 
@@ -251,6 +293,10 @@ int GetAll(int deviceIndex, int gpuIndex)
     {
         Capabilities = ToCapabilitiesDto(caps),
         Topology = ToTopologyDto(gpus, displays),
+        // Same display data as Topology.Displays, reshaped to exactly what
+        // 'set-all'/'set-sync-state' deserialize -- so this dump can be fed
+        // straight back into 'set-all' without hand-editing it first.
+        SyncState = displays.Select(d => new SyncStateEntryDto(d.DisplayId, d.SyncState.ToString(), d.UseExactTiming)).ToArray(),
         ControlParameters = ToControlParamsDto(controlParams),
         SyncStatus = syncStatus,
         StatusParameters = ToStatusParametersDto(statusParams)
@@ -267,12 +313,8 @@ int SetSyncState(FileInfo file)
     var entries = JsonSerializer.Deserialize<SyncStateEntryDto[]>(File.ReadAllText(file.FullName), jsonOptions)
                   ?? throw new InvalidDataException("File did not contain a JSON array of display sync states.");
 
-    var displays = entries
-        .Select(e => NV_GSYNC_DISPLAY.Create(e.DisplayId, Enum.Parse<GSyncDisplaySyncState>(e.SyncState, true), e.UseExactTiming))
-        .ToArray();
-
-    GSyncApi.SetSyncStateSettings(displays);
-    Console.WriteLine($"Set sync state for {displays.Length} display(s).");
+    GSyncApi.SetSyncStateSettings(BuildDisplays(entries));
+    Console.WriteLine($"Sync state applied for {entries.Length} display(s).");
     return 0;
 }
 
@@ -286,28 +328,70 @@ int GetControlParameters(int deviceIndex)
 // Input file: JSON object matching GetControlParameters' output shape.
 // Run adjust-sync-delay first if you're changing SyncSkew/StartupDelay --
 // NVIDIA's own guidance, not an extra step invented here.
+//
+// Deliberately does not print the driver-returned "applied" values: that
+// full dump looks identical in shape to a plain read, so a glance at the
+// output can't tell "this was just read" from "this was just written" --
+// worse, since SyncSkew/StartupDelay often come back unchanged, it can look
+// like the set silently didn't take even when it did. One line saying what
+// happened is unambiguous; the full values are still one 'get-control-
+// parameters' away if actually needed.
 int SetControlParameters(int deviceIndex, FileInfo file)
 {
     var dto = JsonSerializer.Deserialize<ControlParamsDto>(File.ReadAllText(file.FullName), jsonOptions)
               ?? throw new InvalidDataException("File did not contain a control parameters object.");
 
-    var p = new NV_GSYNC_CONTROL_PARAMS
-    {
-        Polarity = Enum.Parse<GSyncPolarity>(dto.Polarity, true),
-        VMode = Enum.Parse<GSyncVideoMode>(dto.VMode, true),
-        Interval = dto.Interval,
-        Source = Enum.Parse<GSyncSyncSource>(dto.Source, true),
-        Bits = (dto.InterlaceMode ? 0x1u : 0u) | (dto.SyncSourceIsOutput ? 0x2u : 0u),
-        SyncSkew = new NV_GSYNC_DELAY { NumLines = dto.SyncSkew.NumLines, NumPixels = dto.SyncSkew.NumPixels },
-        StartupDelay = new NV_GSYNC_DELAY { NumLines = dto.StartupDelay.NumLines, NumPixels = dto.StartupDelay.NumPixels },
-        MultiplyDivideMode = Enum.Parse<GSyncMultiplyDivideMode>(dto.MultiplyDivideMode, true),
-        MultiplyDivideValue = dto.MultiplyDivideValue
-    };
-
-    var applied = GSyncApi.SetControlParameters(ResolveDevice(deviceIndex), p);
-    Console.WriteLine(JsonSerializer.Serialize(ToControlParamsDto(applied), jsonOptions));
+    GSyncApi.SetControlParameters(ResolveDevice(deviceIndex), BuildControlParams(dto));
+    Console.WriteLine("Control parameters applied.");
     return 0;
 }
+
+// Composite: applies SyncState (if present) then ControlParameters (if
+// present) from one file, so a full restore is one command instead of two.
+// Accepts a 'get-all' dump directly (its other fields are ignored) or a
+// minimal file with just the SyncState and/or ControlParameters keys.
+int SetAll(int deviceIndex, FileInfo file)
+{
+    var dto = JsonSerializer.Deserialize<SetAllDto>(File.ReadAllText(file.FullName), jsonOptions)
+              ?? throw new InvalidDataException("File did not contain a recognizable object.");
+
+    if (dto.SyncState == null && dto.ControlParameters == null)
+    {
+        Console.Error.WriteLine("File contained neither SyncState nor ControlParameters -- nothing to apply.");
+        return 1;
+    }
+
+    if (dto.SyncState != null)
+    {
+        GSyncApi.SetSyncStateSettings(BuildDisplays(dto.SyncState));
+        Console.WriteLine($"Sync state applied for {dto.SyncState.Length} display(s).");
+    }
+
+    if (dto.ControlParameters != null)
+    {
+        GSyncApi.SetControlParameters(ResolveDevice(deviceIndex), BuildControlParams(dto.ControlParameters));
+        Console.WriteLine("Control parameters applied.");
+    }
+
+    return 0;
+}
+
+NV_GSYNC_DISPLAY[] BuildDisplays(SyncStateEntryDto[] entries) =>
+    entries.Select(e => NV_GSYNC_DISPLAY.Create(e.DisplayId, Enum.Parse<GSyncDisplaySyncState>(e.SyncState, true), e.UseExactTiming))
+        .ToArray();
+
+NV_GSYNC_CONTROL_PARAMS BuildControlParams(ControlParamsDto dto) => new()
+{
+    Polarity = Enum.Parse<GSyncPolarity>(dto.Polarity, true),
+    VMode = Enum.Parse<GSyncVideoMode>(dto.VMode, true),
+    Interval = dto.Interval,
+    Source = Enum.Parse<GSyncSyncSource>(dto.Source, true),
+    Bits = (dto.InterlaceMode ? 0x1u : 0u) | (dto.SyncSourceIsOutput ? 0x2u : 0u),
+    SyncSkew = new NV_GSYNC_DELAY { NumLines = dto.SyncSkew.NumLines, NumPixels = dto.SyncSkew.NumPixels },
+    StartupDelay = new NV_GSYNC_DELAY { NumLines = dto.StartupDelay.NumLines, NumPixels = dto.StartupDelay.NumPixels },
+    MultiplyDivideMode = Enum.Parse<GSyncMultiplyDivideMode>(dto.MultiplyDivideMode, true),
+    MultiplyDivideValue = dto.MultiplyDivideValue
+};
 
 int AdjustSyncDelay(int deviceIndex, string delayTypeText, uint lines, uint pixels)
 {
@@ -315,15 +399,11 @@ int AdjustSyncDelay(int deviceIndex, string delayTypeText, uint lines, uint pixe
     var (adjusted, syncSteps) = GSyncApi.AdjustSyncDelay(
         ResolveDevice(deviceIndex), delayType, new NV_GSYNC_DELAY { NumLines = lines, NumPixels = pixels });
 
-    var dto = new
-    {
-        adjusted.NumLines,
-        adjusted.NumPixels,
-        adjusted.MaxLines,
-        adjusted.MinPixels,
-        SyncSteps = syncSteps
-    };
-    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    Console.WriteLine($"NumLines: {adjusted.NumLines}");
+    Console.WriteLine($"NumPixels: {adjusted.NumPixels}");
+    Console.WriteLine($"MaxLines: {adjusted.MaxLines}");
+    Console.WriteLine($"MinPixels: {adjusted.MinPixels}");
+    Console.WriteLine($"SyncSteps: {syncSteps}");
     if (syncSteps == 0)
     {
         Console.Error.WriteLine("SyncSteps is 0: NumPixels is below MinPixels, or NumLines exceeds MaxLines, at the current display mode.");
@@ -340,20 +420,27 @@ int GetSyncStatus(int deviceIndex, int gpuIndex)
     }
 
     var status = GSyncApi.GetSyncStatus(ResolveDevice(deviceIndex), gpus[gpuIndex].MemoryAddress);
-    var dto = new
-    {
-        IsSynced = status.IsSynced != 0,
-        IsStereoSynced = status.IsStereoSynced != 0,
-        IsSyncSignalAvailable = status.IsSyncSignalAvailable != 0
-    };
-    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    Console.WriteLine($"IsSynced: {status.IsSynced != 0}");
+    Console.WriteLine($"IsStereoSynced: {status.IsStereoSynced != 0}");
+    Console.WriteLine($"IsSyncSignalAvailable: {status.IsSyncSignalAvailable != 0}");
     return 0;
 }
 
 int GetStatusParameters(int deviceIndex)
 {
     var p = GSyncApi.GetStatusParameters(ResolveDevice(deviceIndex));
-    Console.WriteLine(JsonSerializer.Serialize(ToStatusParametersDto(p), jsonOptions));
+    Console.WriteLine($"RefreshRate: {p.RefreshRate}");
+    for (var i = 0; i < p.RJ45_IO.Length; i++)
+    {
+        Console.WriteLine($"RJ45_IO[{i}]: {(GSyncRJ45IO) p.RJ45_IO[i]}");
+    }
+    for (var i = 0; i < p.RJ45_Ethernet.Length; i++)
+    {
+        Console.WriteLine($"RJ45_Ethernet[{i}]: {p.RJ45_Ethernet[i]}");
+    }
+    Console.WriteLine($"HouseSyncIncoming: {p.HouseSyncIncoming}");
+    Console.WriteLine($"BHouseSync: {p.BHouseSync != 0}");
+    Console.WriteLine($"InternalSlave: {p.InternalSlave}");
     return 0;
 }
 
@@ -437,6 +524,8 @@ object ToControlParamsDto(NV_GSYNC_CONTROL_PARAMS p) => new
 };
 
 record SyncStateEntryDto(uint DisplayId, string SyncState, bool UseExactTiming);
+
+record SetAllDto(SyncStateEntryDto[]? SyncState, ControlParamsDto? ControlParameters);
 
 record ControlParamsDto(
     string Polarity,
