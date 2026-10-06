@@ -75,6 +75,23 @@ var statusParamsCommand = new Command("get-status-parameters", "NvAPI_GSync_GetS
 {
     deviceOption
 };
+var getSyncStateCommand = new Command("get-sync-state",
+    "Derived from NvAPI_GSync_GetTopology -- display sync-state entries in exactly the shape 'set-sync-state' " +
+    "expects (DisplayId, SyncState, UseExactTiming), so get-sync-state > file.json then set-sync-state file.json " +
+    "round-trips directly. There's no single NvAPI_GSync_GetSyncState call -- this is a view over get-topology's " +
+    "Displays, not a tenth NVAPI function.")
+{
+    deviceOption
+};
+var getAllCommand = new Command("get-all",
+    "Everything readable, in one JSON object: Capabilities, Topology, ControlParameters, SyncStatus (for --gpu), " +
+    "StatusParameters. Only the SyncState portion of Topology and ControlParameters are actually restorable via " +
+    "set-* -- Capabilities, SyncStatus, and StatusParameters are read-only hardware/telemetry info, included for " +
+    "a complete record, not because there's anything to write them back with.")
+{
+    deviceOption,
+    gpuOption
+};
 var debugSizesCommand = new Command("debug-sizes",
     "Print Marshal.SizeOf for every GSync struct -- no NVAPI calls, safe to run anywhere. " +
     "Use when a call fails with IncompatibleStructureVersion to check the computed size against hand-calculated expectations.");
@@ -90,6 +107,8 @@ rootCommand.Subcommands.Add(setControlCommand);
 rootCommand.Subcommands.Add(adjustDelayCommand);
 rootCommand.Subcommands.Add(syncStatusCommand);
 rootCommand.Subcommands.Add(statusParamsCommand);
+rootCommand.Subcommands.Add(getSyncStateCommand);
+rootCommand.Subcommands.Add(getAllCommand);
 rootCommand.Subcommands.Add(debugSizesCommand);
 
 // See NvFarmSync/NvMosaic for why this is caught explicitly rather than
@@ -122,6 +141,9 @@ adjustDelayCommand.SetAction(parseResult => RunSafely(parseResult, () => AdjustS
 syncStatusCommand.SetAction(parseResult =>
     RunSafely(parseResult, () => GetSyncStatus(parseResult.GetValue(deviceOption), parseResult.GetValue(gpuOption))));
 statusParamsCommand.SetAction(parseResult => RunSafely(parseResult, () => GetStatusParameters(parseResult.GetValue(deviceOption))));
+getSyncStateCommand.SetAction(parseResult => RunSafely(parseResult, () => GetSyncState(parseResult.GetValue(deviceOption))));
+getAllCommand.SetAction(parseResult =>
+    RunSafely(parseResult, () => GetAll(parseResult.GetValue(deviceOption), parseResult.GetValue(gpuOption))));
 debugSizesCommand.SetAction(parseResult => RunSafely(parseResult, DebugSizes));
 
 return rootCommand.Parse(args).Invoke();
@@ -183,38 +205,55 @@ int EnumSyncDevices()
 int QueryCapabilities(int deviceIndex)
 {
     var caps = GSyncApi.QueryCapabilities(ResolveDevice(deviceIndex));
-    var dto = new
-    {
-        caps.BoardId,
-        caps.Revision,
-        caps.ExtendedRevision,
-        caps.CapFlags,
-        caps.IsMulDivSupported,
-        caps.MaxMulDivValue
-    };
-    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    Console.WriteLine(JsonSerializer.Serialize(ToCapabilitiesDto(caps), jsonOptions));
     return 0;
 }
 
 int GetTopology(int deviceIndex)
 {
     var (gpus, displays) = GSyncApi.GetTopology(ResolveDevice(deviceIndex));
+    Console.WriteLine(JsonSerializer.Serialize(ToTopologyDto(gpus, displays), jsonOptions));
+    return 0;
+}
+
+// Same NvAPI_GSync_GetTopology call as 'get-topology', reshaped to exactly
+// what 'set-sync-state' deserializes -- see that command's description.
+int GetSyncState(int deviceIndex)
+{
+    var (_, displays) = GSyncApi.GetTopology(ResolveDevice(deviceIndex));
+    var dto = displays.Select(d => new SyncStateEntryDto(d.DisplayId, d.SyncState.ToString(), d.UseExactTiming)).ToArray();
+    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    return 0;
+}
+
+int GetAll(int deviceIndex, int gpuIndex)
+{
+    var device = ResolveDevice(deviceIndex);
+    var caps = GSyncApi.QueryCapabilities(device);
+    var (gpus, displays) = GSyncApi.GetTopology(device);
+    var controlParams = GSyncApi.GetControlParameters(device);
+    var statusParams = GSyncApi.GetStatusParameters(device);
+
+    object? syncStatus = null;
+    var physicalGpus = NvAPIWrapper.Native.GPUApi.EnumPhysicalGPUs();
+    if (gpuIndex >= 0 && gpuIndex < physicalGpus.Length)
+    {
+        var s = GSyncApi.GetSyncStatus(device, physicalGpus[gpuIndex].MemoryAddress);
+        syncStatus = new
+        {
+            IsSynced = s.IsSynced != 0,
+            IsStereoSynced = s.IsStereoSynced != 0,
+            IsSyncSignalAvailable = s.IsSyncSignalAvailable != 0
+        };
+    }
+
     var dto = new
     {
-        Gpus = gpus.Select(g => new
-        {
-            PhysicalGpu = $"0x{g.PhysicalGpu.ToInt64():X}",
-            Connector = g.Connector.ToString(),
-            ProxyPhysicalGpu = g.ProxyPhysicalGpu == IntPtr.Zero ? null : $"0x{g.ProxyPhysicalGpu.ToInt64():X}",
-            g.IsSynced
-        }),
-        Displays = displays.Select(d => new
-        {
-            d.DisplayId,
-            d.IsMasterable,
-            d.UseExactTiming,
-            SyncState = d.SyncState.ToString()
-        })
+        Capabilities = ToCapabilitiesDto(caps),
+        Topology = ToTopologyDto(gpus, displays),
+        ControlParameters = ToControlParamsDto(controlParams),
+        SyncStatus = syncStatus,
+        StatusParameters = ToStatusParametersDto(statusParams)
     };
     Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
     return 0;
@@ -314,16 +353,7 @@ int GetSyncStatus(int deviceIndex, int gpuIndex)
 int GetStatusParameters(int deviceIndex)
 {
     var p = GSyncApi.GetStatusParameters(ResolveDevice(deviceIndex));
-    var dto = new
-    {
-        p.RefreshRate,
-        RJ45_IO = p.RJ45_IO.Select(v => ((GSyncRJ45IO) v).ToString()).ToArray(),
-        RJ45_Ethernet = p.RJ45_Ethernet,
-        p.HouseSyncIncoming,
-        BHouseSync = p.BHouseSync != 0,
-        p.InternalSlave
-    };
-    Console.WriteLine(JsonSerializer.Serialize(dto, jsonOptions));
+    Console.WriteLine(JsonSerializer.Serialize(ToStatusParametersDto(p), jsonOptions));
     return 0;
 }
 
@@ -353,6 +383,44 @@ int DebugSizes()
     Row(nameof(NV_GSYNC_STATUS_PARAMS), System.Runtime.InteropServices.Marshal.SizeOf<NV_GSYNC_STATUS_PARAMS>(), 36);
     return 0;
 }
+
+object ToCapabilitiesDto(NV_GSYNC_CAPABILITIES caps) => new
+{
+    caps.BoardId,
+    caps.Revision,
+    caps.ExtendedRevision,
+    caps.CapFlags,
+    caps.IsMulDivSupported,
+    caps.MaxMulDivValue
+};
+
+object ToTopologyDto(NV_GSYNC_GPU[] gpus, NV_GSYNC_DISPLAY[] displays) => new
+{
+    Gpus = gpus.Select(g => new
+    {
+        PhysicalGpu = $"0x{g.PhysicalGpu.ToInt64():X}",
+        Connector = g.Connector.ToString(),
+        ProxyPhysicalGpu = g.ProxyPhysicalGpu == IntPtr.Zero ? null : $"0x{g.ProxyPhysicalGpu.ToInt64():X}",
+        g.IsSynced
+    }),
+    Displays = displays.Select(d => new
+    {
+        d.DisplayId,
+        d.IsMasterable,
+        d.UseExactTiming,
+        SyncState = d.SyncState.ToString()
+    })
+};
+
+object ToStatusParametersDto(NV_GSYNC_STATUS_PARAMS p) => new
+{
+    p.RefreshRate,
+    RJ45_IO = p.RJ45_IO.Select(v => ((GSyncRJ45IO) v).ToString()).ToArray(),
+    RJ45_Ethernet = p.RJ45_Ethernet,
+    p.HouseSyncIncoming,
+    BHouseSync = p.BHouseSync != 0,
+    p.InternalSlave
+};
 
 object ToControlParamsDto(NV_GSYNC_CONTROL_PARAMS p) => new
 {

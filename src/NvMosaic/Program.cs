@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.Text.Json;
+using System.Threading;
 using NvAPIWrapper;
 using NvAPIWrapper.Native;
 using NvAPIWrapper.Native.Display;
@@ -18,6 +19,16 @@ var fileArgument = new Argument<FileInfo>("file")
 {
     Description = "JSON file produced by 'list'"
 };
+var retriesOption = new Option<int>("--retries")
+{
+    Description = "Retry NvAPI_Mosaic_SetDisplayGrids this many additional times on failure, one second apart. " +
+                  "The exact same call has been observed on real hardware to fail once and then succeed on a " +
+                  "bare retry -- a transient driver-state race (observed right after unconfiguring Mosaic via " +
+                  "the GUI), not a data/marshaling bug -- and a failed attempt disables the current " +
+                  "configuration rather than leaving it alone, so this automates the workaround instead of " +
+                  "depending on someone noticing and re-running by hand.",
+    DefaultValueFactory = _ => 2
+};
 var outOption = new Option<FileInfo?>("--out")
 {
     Description = "Write output to this file instead of stdout. Needed when running via a cross-session " +
@@ -30,12 +41,25 @@ var getCommand = new Command("get", "NvAPI_Mosaic_GetCurrentTopology -- get the 
 var setCommand = new Command("set", "NvAPI_Mosaic_SetDisplayGrids -- apply a grid topology from a JSON file")
 {
     fileArgument,
-    flagsOption
+    flagsOption,
+    retriesOption
 };
 var validateCommand = new Command("validate", "NvAPI_Mosaic_ValidateDisplayGrids -- validate a grid topology from a JSON file without applying it")
 {
     fileArgument,
     flagsOption
+};
+var enableArgument = new Argument<bool>("enable")
+{
+    Description = "true or false"
+};
+var enableTopologyCommand = new Command("enable-current-topology",
+    "NvAPI_Mosaic_EnableCurrentTopology -- enable or disable whatever topology is currently set, without changing it. " +
+    "Exposed as its own command (not folded into 'set') to test whether 'set' failing intermittently on an already-" +
+    "configured Mosaic is fixed by disabling first -- try 'enable-current-topology false' then 'set <file>' and see " +
+    "if that's now reliable every time, before this gets baked into anything automatically.")
+{
+    enableArgument
 };
 
 var rootCommand = new RootCommand("NvMosaic -- NVIDIA Mosaic display topology fleet management");
@@ -44,6 +68,7 @@ rootCommand.Subcommands.Add(listCommand);
 rootCommand.Subcommands.Add(getCommand);
 rootCommand.Subcommands.Add(setCommand);
 rootCommand.Subcommands.Add(validateCommand);
+rootCommand.Subcommands.Add(enableTopologyCommand);
 
 // See NvFarmSync for why this is caught explicitly rather than left as an
 // unhandled crash: no NVIDIA driver present is an expected outcome for some
@@ -64,11 +89,20 @@ var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 listCommand.SetAction(parseResult => RunSafely(parseResult, List));
 getCommand.SetAction(parseResult => RunSafely(parseResult, Get));
 setCommand.SetAction(parseResult =>
-    RunSafely(parseResult, () => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true)));
+    RunSafely(parseResult, () => SetOrValidate(
+        parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: true, parseResult.GetValue(retriesOption))));
 validateCommand.SetAction(parseResult =>
     RunSafely(parseResult, () => SetOrValidate(parseResult.GetValue(fileArgument)!, parseResult.GetValue(flagsOption)!, apply: false)));
+enableTopologyCommand.SetAction(parseResult => RunSafely(parseResult, () => EnableCurrentTopology(parseResult.GetValue(enableArgument))));
 
 return rootCommand.Parse(args).Invoke();
+
+int EnableCurrentTopology(bool enable)
+{
+    MosaicApi.EnableCurrentTopology(enable);
+    Console.WriteLine(enable ? "Enabled." : "Disabled.");
+    return 0;
+}
 
 // System.CommandLine 2.0.12 doesn't catch action exceptions itself (confirmed:
 // an uncaught one reaches the process as a raw .NET stack trace). NVAPI calls
@@ -143,7 +177,7 @@ int Get()
     return 0;
 }
 
-int SetOrValidate(FileInfo file, string flagsText, bool apply)
+int SetOrValidate(FileInfo file, string flagsText, bool apply, int retries = 0)
 {
     SetDisplayTopologyFlag flags;
     try
@@ -172,8 +206,24 @@ int SetOrValidate(FileInfo file, string flagsText, bool apply)
 
     if (apply)
     {
-        MosaicApi.SetDisplayGrids(gridTopologies, flags);
-        Console.WriteLine($"Applied {gridTopologies.Length} grid topolog{(gridTopologies.Length == 1 ? "y" : "ies")}.");
+        var attempt = 0;
+        while (true)
+        {
+            try
+            {
+                MosaicApi.SetDisplayGrids(gridTopologies, flags);
+                break;
+            }
+            catch (NVIDIAApiException ex) when (attempt < retries)
+            {
+                attempt++;
+                Console.Error.WriteLine($"SetDisplayGrids failed ({ex.Status}), attempt {attempt}/{retries + 1} -- retrying in 1s...");
+                Thread.Sleep(1000);
+            }
+        }
+
+        var retryNote = attempt > 0 ? $" (succeeded after {attempt} retr{(attempt == 1 ? "y" : "ies")})" : "";
+        Console.WriteLine($"Applied {gridTopologies.Length} grid topolog{(gridTopologies.Length == 1 ? "y" : "ies")}{retryNote}.");
     }
     else
     {
